@@ -1,4 +1,5 @@
-// ========== 第一部分：后端核心 ==========
+// ========== 第一部分：后端核心（修正版）==========
+// 复制此部分到 Worker 脚本开头，第二部分 getHTML() 紧接其后
 
 const memoryStore = new Map();
 const EXCLUDED_TYPES = ['direct', 'selector', 'urltest', 'dns', 'block'];
@@ -16,7 +17,6 @@ export default {
       });
     }
     if (url.pathname === '/' && request.method === 'GET') {
-      // 注意：这里引用了第二部分定义的 getHTML 函数
       return new Response(getHTML(), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });
@@ -43,7 +43,7 @@ async function handleFetchProxies(request) {
     const tasks = sources.map(async (src) => {
       const { name, url, type = 'selector' } = src;
       try {
-        const resp = await fetch(url, { headers: { 'User-Agent': 'SubMerger/2.3' } });
+        const resp = await fetch(url, { headers: { 'User-Agent': 'SubMerger/2.4' } });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         let text = await resp.text();
 
@@ -119,13 +119,80 @@ function tryJSON(text) {
 }
 
 function tryYAML(text) {
+  // 1. 尝试完整 YAML 解析
   let doc = parseYAML(text);
   let proxies = extractProxies(doc);
   if (proxies.length) return convertClashToSingBox(proxies);
-  try { doc = parseYAML(atob(text.trim())); proxies = extractProxies(doc); if (proxies.length) return convertClashToSingBox(proxies); } catch (_) {}
+
+  // 2. 尝试 Base64 解码后解析
+  try {
+    doc = parseYAML(atob(text.trim()));
+    proxies = extractProxies(doc);
+    if (proxies.length) return convertClashToSingBox(proxies);
+  } catch (_) {}
+
+  // 3. 后备方案：直接提取 proxies 下方的行内 JSON 列表（支持大多数 Clash 配置）
+  proxies = extractProxiesFromYAMLText(text);
+  if (proxies.length) return convertClashToSingBox(proxies);
+
+  // 4. 对 Base64 编码也尝试后备方案
+  try {
+    const decoded = atob(text.trim());
+    proxies = extractProxiesFromYAMLText(decoded);
+    if (proxies.length) return convertClashToSingBox(proxies);
+  } catch (_) {}
+
   return [];
 }
 
+// 备用：直接查找 "proxies:" 行，提取后续的 - {...} 行并 JSON.parse
+function extractProxiesFromYAMLText(text) {
+  const lines = text.split(/\r?\n/);
+  let startLine = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (trimmed === 'proxies:' || trimmed === 'Proxies:' || trimmed === 'PROXIES:') {
+      startLine = i + 1;
+      break;
+    }
+  }
+  if (startLine === -1) return [];
+
+  const proxyLines = [];
+  let baseIndent = -1;
+  for (let i = startLine; i < lines.length; i++) {
+    const raw = lines[i];
+    const trimmed = raw.trim();
+    if (trimmed === '') continue;
+    const indent = raw.search(/\S/);
+    if (!trimmed.startsWith('- ')) {
+      // 遇到非列表项且缩进不比 baseIndent 大，停止
+      if (baseIndent === -1) break;
+      if (indent <= baseIndent) break;
+      continue;
+    }
+    if (baseIndent === -1) baseIndent = indent;
+    else if (indent < baseIndent) break;
+    proxyLines.push(trimmed.substring(2).trim());
+  }
+
+  const proxies = [];
+  for (const line of proxyLines) {
+    const match = line.match(/^\{(.+)\}$/);
+    if (!match) continue;
+    try {
+      const obj = JSON.parse(match[0]);
+      // 确保有 tag 字段，使用 name 或 server
+      obj.tag = obj.name || obj.server || 'unnamed';
+      proxies.push(obj);
+    } catch (e) {
+      // 忽略解析失败的行
+    }
+  }
+  return proxies;
+}
+
+// 提取 proxies 数组
 function extractProxies(obj) {
   if (Array.isArray(obj)) return obj;
   if (typeof obj === 'object' && obj !== null) {
@@ -151,16 +218,26 @@ function parseProxyURI(uri) {
     const schemeEnd = uri.indexOf('://');
     if (schemeEnd === -1) return null;
     const scheme = uri.substring(0, schemeEnd).toLowerCase();
-    let  rest = uri.substring(schemeEnd + 3);
+    // 注意：此处使用 let 以便后续修改 rest
+    let rest = uri.substring(schemeEnd + 3);
     let name = '';
     const hashIdx = rest.indexOf('#');
-    if (hashIdx !== -1) { name = decodeURIComponent(rest.substring(hashIdx + 1)); rest = rest.substring(0, hashIdx); }
+    if (hashIdx !== -1) {
+      name = decodeURIComponent(rest.substring(hashIdx + 1));
+      rest = rest.substring(0, hashIdx);
+    }
     const atIdx = rest.lastIndexOf('@');
     let userinfo = '', hostport = rest;
-    if (atIdx !== -1) { userinfo = rest.substring(0, atIdx); hostport = rest.substring(atIdx + 1); }
+    if (atIdx !== -1) {
+      userinfo = rest.substring(0, atIdx);
+      hostport = rest.substring(atIdx + 1);
+    }
     const qsIdx = hostport.indexOf('?');
     let params = {};
-    if (qsIdx !== -1) { params = Object.fromEntries(new URLSearchParams(hostport.substring(qsIdx + 1)).entries()); hostport = hostport.substring(0, qsIdx); }
+    if (qsIdx !== -1) {
+      params = Object.fromEntries(new URLSearchParams(hostport.substring(qsIdx + 1)).entries());
+      hostport = hostport.substring(0, qsIdx);
+    }
     const [host, portStr] = hostport.split(':');
     const port = parseInt(portStr) || 0;
     const tag = name || `${host}:${port}`;
@@ -168,14 +245,26 @@ function parseProxyURI(uri) {
       case 'ss': {
         let method, password;
         if (userinfo) {
-          try { const d = atob(userinfo); const idx = d.indexOf(':'); if (idx !== -1) { method = d.substring(0, idx); password = d.substring(idx + 1); } } catch (_) {}
+          try {
+            const d = atob(userinfo);
+            const idx = d.indexOf(':');
+            if (idx !== -1) { method = d.substring(0, idx); password = d.substring(idx + 1); }
+          } catch (_) {}
         }
         return { type: 'shadowsocks', tag, server: host, server_port: port, method: method || 'aes-256-gcm', password: password || '' };
       }
       case 'vmess': {
         try {
           const json = JSON.parse(atob(userinfo));
-          const vm = { type: 'vmess', tag: json.ps || tag, server: json.add, server_port: parseInt(json.port) || 0, uuid: json.id, security: json.scy || 'auto', alter_id: parseInt(json.aid) || 0 };
+          const vm = {
+            type: 'vmess',
+            tag: json.ps || tag,
+            server: json.add,
+            server_port: parseInt(json.port) || 0,
+            uuid: json.id,
+            security: json.scy || 'auto',
+            alter_id: parseInt(json.aid) || 0,
+          };
           if (json.tls) vm.tls = { enabled: true, server_name: json.sni || host };
           return vm;
         } catch (_) {}
@@ -205,7 +294,7 @@ function parseProxyURI(uri) {
   } catch (_) { return null; }
 }
 
-// ----- YAML 解析器（支持行内映射） -----
+// ----- YAML 解析器（保留，但不再作为唯一手段） -----
 function parseYAML(text) {
   const lines = text.split(/\r?\n/);
   let i = 0;
@@ -343,7 +432,7 @@ function convertClashToSingBox(proxies) {
   if (!Array.isArray(proxies)) return [];
   return proxies.map(p => {
     if (!p || typeof p !== 'object') return null;
-    const base = { tag: p.name || p.server || 'unknown' };
+    const base = { tag: p.tag || p.name || p.server || 'unknown' };
     function getTLS() {
       if (p.tls || p.sni || p.servername) {
         const tls = { enabled: true };
