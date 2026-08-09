@@ -802,35 +802,454 @@ function getHTML() {
         };
 
         updateCacheIndicators();
+// _workers.js – Sing‑Box & Clash 订阅合并器（支持 vless/anytls）
+// 部署时建议绑定 KV 命名空间至变量 SUB_CONFIG
+
+const memoryStore = new Map();
+const EXCLUDED_TYPES = ['direct', 'selector', 'urltest', 'dns', 'block'];
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type',
+        },
+      });
+    }
+    if (url.pathname === '/' && request.method === 'GET') {
+      return new Response(getHTML(), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      });
+    }
+    if (url.pathname === '/api/fetch' && request.method === 'POST') {
+      return handleFetchProxies(request);
+    }
+    if (url.pathname === '/api/update' && request.method === 'POST') {
+      return handleUpdate(request, env);
+    }
+    if (url.pathname === '/api/latest' && request.method === 'GET') {
+      return handleGetLatest(env);
+    }
+    return new Response('Not Found', { status: 404 });
+  },
+};
+
+/* ========== 拉取并解析多个源（JSON/YAML） ========== */
+async function handleFetchProxies(request) {
+  try {
+    const { sources } = await request.json();
+    if (!Array.isArray(sources) || sources.length === 0) throw new Error('至少需要一个订阅源');
+
+    const tasks = sources.map(async (src) => {
+      const { name, url, type = 'selector' } = src;
+      try {
+        const resp = await fetch(url, {
+          headers: { 'User-Agent': 'SubMerger/2.0' },
+        });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        let text = await resp.text();
+
+        // 尝试 Base64 解码
+        try {
+          const decoded = atob(text.trim());
+          if (decoded.trim().startsWith('{') || decoded.trim().startsWith('[') || decoded.includes('proxies:')) {
+            text = decoded;
+          }
+        } catch (_) {}
+
+        let outbounds = [];
+
+        // 1. 尝试 JSON
+        try {
+          const data = JSON.parse(text);
+          if (Array.isArray(data)) {
+            outbounds = data;
+          } else if (data.outbounds && Array.isArray(data.outbounds)) {
+            outbounds = data.outbounds;
+          }
+        } catch (_) {}
+
+        // 2. 尝试 Clash YAML
+        if (outbounds.length === 0) {
+          const clashProxies = parseClashProxies(text);
+          if (clashProxies.length > 0) {
+            outbounds = convertClashToSingBox(clashProxies);
+          }
+        }
+
+        if (outbounds.length === 0) throw new Error('无法识别格式或无有效节点');
+
+        const filtered = outbounds.filter(
+          (ob) => ob && typeof ob === 'object' && !EXCLUDED_TYPES.includes(ob.type)
+        );
+        const proxies = filtered.map((ob) => ({
+          ...ob,
+          tag: ob.tag || 'unnamed',
+        }));
+
+        if (!proxies.length) return { name, url, proxies: [], group: null, error: '该源无有效代理节点' };
+
+        const tags = proxies.map((p) => p.tag);
+        const group = { type, tag: name, outbounds: tags };
+        if (type === 'selector') group.default = tags[0] || '';
+
+        return { name, url, proxies, group, error: null };
+      } catch (e) {
+        return { name, url, proxies: [], group: null, error: e.message };
       }
+    });
 
-      // ---------- 事件绑定 ----------
-      generateBtn.addEventListener('click', () => performGenerate(false));
-      refreshBtn.addEventListener('click', () => performGenerate(true));
+    const results = await Promise.all(tasks);
 
-      addBtn.addEventListener('click', () => {
-        sourcesContainer.appendChild(createSourceRow());
-        scheduleSave();
-        updateCacheIndicators();
+    // 全局 tag 去重
+    const usedTags = new Set();
+    results.forEach((res) => {
+      if (res.error || !res.proxies) return;
+      res.proxies = res.proxies.map((proxy) => {
+        let tag = proxy.tag;
+        if (usedTags.has(tag)) {
+          let suffix = ` (${res.name})`;
+          let newTag = tag + suffix;
+          let count = 1;
+          while (usedTags.has(newTag)) {
+            count++;
+            newTag = `${tag} (${res.name} ${count})`;
+          }
+          tag = newTag;
+        }
+        usedTags.add(tag);
+        return { ...proxy, tag };
       });
+      if (res.group) {
+        res.group.outbounds = res.proxies.map((p) => p.tag);
+        if (res.group.type === 'selector' && res.group.outbounds.length > 0) {
+          res.group.default = res.group.outbounds[0];
+        }
+      }
+    });
 
-      configInput.addEventListener('input', scheduleSave);
+    return new Response(JSON.stringify({ results }), {
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: e.message }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+    });
+  }
+}
 
-      importFileBtn.addEventListener('click', () => {
-        const input = document.createElement('input');
-        input.type = 'file';
-        input.accept = '.json,.txt';
-        input.onchange = e => {
-          const file = e.target.files[0];
-          if (!file) return;
-          const reader = new FileReader();
-          reader.onload = ev => { configInput.value = ev.target.result; scheduleSave(); };
-          reader.readAsText(file);
+/* ========== 从 Clash YAML 提取 proxies ========== */
+function parseClashProxies(text) {
+  const lines = text.split(/\r?\n/);
+  const proxies = [];
+  let inProxies = false;
+  let currentProxy = null;
+  let currentIndent = -1;
+
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const line = raw.replace(/#.*$/, '').trimEnd();
+    if (line.trim() === '') continue;
+
+    const indent = raw.search(/\S/);
+    const content = line.trim();
+
+    if (!inProxies && content === 'proxies:') {
+      inProxies = true;
+      continue;
+    }
+
+    if (inProxies) {
+      if (indent === 0 && content !== 'proxies:' && !content.startsWith('-')) break;
+
+      if (content.startsWith('- ')) {
+        if (currentProxy) proxies.push(currentProxy);
+        currentProxy = {};
+        const rest = content.substring(2).trim();
+        if (rest.includes(':')) {
+          const kv = splitKeyValue(rest);
+          if (kv) currentProxy[kv.key] = kv.value;
+        }
+        currentIndent = indent;
+      } else if (currentProxy && indent > currentIndent) {
+        const kv = splitKeyValue(content);
+        if (kv) currentProxy[kv.key] = kv.value;
+      } else if (currentProxy && indent <= currentIndent) {
+        proxies.push(currentProxy);
+        currentProxy = null;
+        if (content.startsWith('- ')) {
+          const rest = content.substring(2).trim();
+          currentProxy = {};
+          const kv = splitKeyValue(rest);
+          if (kv) currentProxy[kv.key] = kv.value;
+          currentIndent = indent;
+        } else break;
+      }
+    }
+  }
+  if (currentProxy) proxies.push(currentProxy);
+  return proxies;
+}
+
+function splitKeyValue(str) {
+  const idx = str.indexOf(':');
+  if (idx === -1) return null;
+  const key = str.substring(0, idx).trim();
+  let value = str.substring(idx + 1).trim();
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    value = value.slice(1, -1);
+  }
+  return { key, value };
+}
+
+/* ========== Clash 代理 → Sing‑Box 出站 ========== */
+function convertClashToSingBox(clashProxies) {
+  return clashProxies.map((p) => {
+    const base = { tag: p.name || p.server || 'unknown' };
+    switch (p.type) {
+      case 'ss':
+        return {
+          ...base,
+          type: 'shadowsocks',
+          server: p.server,
+          server_port: parseInt(p.port) || 0,
+          method: p.cipher || 'aes-256-gcm',
+          password: p.password,
         };
-        input.click();
-      });
+      case 'vmess':
+        return {
+          ...base,
+          type: 'vmess',
+          server: p.server,
+          server_port: parseInt(p.port) || 0,
+          uuid: p.uuid,
+          security: p.cipher || 'auto',
+          alter_id: parseInt(p.alterId) || 0,
+        };
+      case 'trojan':
+        const trojan = {
+          ...base,
+          type: 'trojan',
+          server: p.server,
+          server_port: parseInt(p.port) || 0,
+          password: p.password,
+        };
+        if (p.sni || p.servername) trojan.tls = { enabled: true, server_name: p.sni || p.servername };
+        return trojan;
+      case 'vless':
+        const vless = {
+          ...base,
+          type: 'vless',
+          server: p.server,
+          server_port: parseInt(p.port) || 443,
+          uuid: p.uuid,
+        };
+        if (p.flow) vless.flow = p.flow;
+        if (p.tls) {
+          vless.tls = { enabled: true };
+          if (p.servername) vless.tls.server_name = p.servername;
+          if (p['reality-opts']) {
+            vless.tls.reality = { enabled: true };
+            if (p['reality-opts'].public_key) vless.tls.reality.public_key = p['reality-opts'].public_key;
+            if (p['reality-opts'].short_id) vless.tls.reality.short_id = p['reality-opts'].short_id;
+          }
+        }
+        if (p.network) {
+          vless.transport = { type: p.network };
+          if (p.network === 'ws') {
+            if (p.ws_opts?.path) vless.transport.path = p.ws_opts.path;
+            if (p.ws_opts?.headers?.Host) vless.transport.headers = { Host: p.ws_opts.headers.Host };
+          } else if (p.network === 'grpc') {
+            if (p.grpc_opts?.serviceName) vless.transport.service_name = p.grpc_opts.serviceName;
+          }
+        }
+        return vless;
+      case 'anytls':
+        const anytls = {
+          ...base,
+          type: 'anytls',
+          server: p.server,
+          server_port: parseInt(p.port) || 443,
+          password: p.password,
+          tls: {},
+        };
+        if (p.sni || p.servername) anytls.tls.server_name = p.sni || p.servername;
+        if (Object.keys(anytls.tls).length === 0) delete anytls.tls;
+        return anytls;
+      case 'http':
+        return {
+          ...base,
+          type: 'http',
+          server: p.server,
+          server_port: parseInt(p.port) || 0,
+          username: p.username || '',
+          password: p.password || '',
+        };
+      case 'socks5':
+        return {
+          ...base,
+          type: 'socks',
+          server: p.server,
+          server_port: parseInt(p.port) || 0,
+          username: p.username || '',
+          password: p.password || '',
+        };
+      default:
+        return null;
+    }
+  }).filter(Boolean);
+}
 
-      copyPermaBtn.addEventListener('click', async () => {
+/* ========== 永久订阅链接 ========== */
+async function handleUpdate(request, env) {
+  const configStr = JSON.stringify(await request.json());
+  if (env.SUB_CONFIG) {
+    await env.SUB_CONFIG.put('latest', configStr);
+  } else {
+    memoryStore.set('latest', configStr);
+  }
+  return new Response(JSON.stringify({ success: true }), {
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+  });
+}
+
+async function handleGetLatest(env) {
+  const config = env.SUB_CONFIG
+    ? await env.SUB_CONFIG.get('latest', 'text')
+    : memoryStore.get('latest');
+  if (config) {
+    return new Response(config, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-cache',
+      },
+    });
+  }
+  return new Response('尚未生成任何配置', { status: 404 });
+}
+
+/* ========== 前端 HTML ========== */
+function getHTML() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sing‑Box / Clash 订阅合并器</title>
+  <style>
+    * { box-sizing: border-box; } body { font-family: -apple-system, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 1rem; background: #f2f2f7; color: #1c1c1e; }
+    .card { background: #fff; border-radius: 12px; padding: 1.2rem; margin-bottom: 1.5rem; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+    .source-row { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-bottom: 0.6rem; align-items: center; }
+    input, select { padding: 0.5rem; border: 1px solid #d1d1d6; border-radius: 8px; min-width: 0; }
+    .name { flex: 1 1 100px; } .url { flex: 3 1 200px; } .type { flex: 0 1 110px; }
+    button { padding: 0.5rem 1rem; border: none; border-radius: 8px; cursor: pointer; color: #fff; font-weight: 500; }
+    .remove-btn { background: #ff3b30; } .add-btn { background: #007aff; } .action-btn { background: #34c759; margin-right: 0.5rem; } .refresh-btn { background: #ff9f0a; margin-right: 0.5rem; } .copy-btn { background: #5e5ce6; }
+    .code-editor { width: 100%; min-height: 150px; font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 8px; resize: vertical; }
+    .output-area { width: 100%; height: 400px; font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 8px; }
+    #status { margin: 0.8rem 0; } .error { color: #ff3b30; } .warning { color: #ff9f0a; } .success { color: #34c759; } .info { color: #5e5ce6; }
+    .subscription-link-box { background: #1e1e1e; color: #d4d4d4; padding: 0.6rem; border-radius: 8px; display: flex; align-items: center; gap: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>🔀 Sing‑Box / Clash 订阅合并器</h1>
+  <p>支持 JSON (Sing‑Box) 与 YAML (Clash) 格式源，自动合并为 Sing‑Box 配置（含 vless/anytls）。</p>
+
+  <div class="card">
+    <h2>🔗 永久订阅链接</h2>
+    <div id="subscription-link-container">
+      <div class="subscription-link-box" id="subscription-link-box" style="display:none;"><span id="subscription-link-text"></span><button id="copy-permanent-link">📋 复制</button></div>
+      <p id="no-link-hint">尚未生成配置</p>
+    </div>
+    <p style="font-size:0.8rem;">建议绑定 KV 至 <code>SUB_CONFIG</code> 实现永久存储。</p>
+  </div>
+
+  <div class="card">
+    <h2>📥 订阅源</h2>
+    <div id="sources-container"></div>
+    <button id="add-source" class="add-btn">＋ 添加</button>
+  </div>
+
+  <div class="card">
+    <h2>📦 其他配置 (JSON)</h2>
+    <p><button class="import-btn" id="import-file-btn">📂 从文件导入</button></p>
+    <textarea id="config-input" class="code-editor" placeholder='{"log":{"level":"info"},"inbounds":[...]}'></textarea>
+  </div>
+
+  <div>
+    <button id="generate" class="action-btn">⚡ 生成（缓存）</button>
+    <button id="refresh-generate" class="refresh-btn">🔄 强制刷新</button>
+    <button id="download" class="action-btn" style="display:none;">⬇ 下载</button>
+    <button id="copy-result" class="copy-btn" style="display:none;">📋 复制</button>
+  </div>
+  <div id="status"></div>
+  <div id="result" style="display:none;" class="card">
+    <h2>✅ 配置</h2>
+    <textarea id="output" class="output-area" readonly></textarea>
+  </div>
+
+  <script>
+    (function() {
+      const DB_NAME='sub-merger', DB_VERSION=3;
+      const CONFIG_STORE='config', CACHE_STORE='cache', META_STORE='meta';
+      const PERMALINK_KEY='permalink', SOURCES_KEY='sources';
+      let db;
+      function openDB() { return new Promise((res, rej) => {
+        if(db) return res(db);
+        const req=indexedDB.open(DB_NAME, DB_VERSION);
+        req.onupgradeneeded= e => {
+          const d=e.target.result;
+          if(!d.objectStoreNames.contains(CONFIG_STORE)) d.createObjectStore(CONFIG_STORE,{keyPath:'id'});
+          if(!d.objectStoreNames.contains(CACHE_STORE)) d.createObjectStore(CACHE_STORE,{keyPath:'url'});
+          if(!d.objectStoreNames.contains(META_STORE)) d.createObjectStore(META_STORE,{keyPath:'id'});
+        };
+        req.onsuccess= e => { db=e.target.result; res(db); };
+        req.onerror= e => rej(e.target.error);
+      })}
+      async function saveConfigToDB(text){try{const d=await openDB(); const tx=d.transaction(CONFIG_STORE,'readwrite'); tx.objectStore(CONFIG_STORE).put({id:'cfg',value:text}); return new Promise(r=>tx.oncomplete=r)}catch(e){}}
+      async function loadConfigFromDB(){try{const d=await openDB(); const tx=d.transaction(CONFIG_STORE,'readonly'); const req=tx.objectStore(CONFIG_STORE).get('cfg'); return new Promise(r=>req.onsuccess=()=>r(req.result?req.result.value:''))}catch(e){return''}}
+      async function saveProxyCache(url,proxies,group){try{const d=await openDB(); const tx=d.transaction(CACHE_STORE,'readwrite'); tx.objectStore(CACHE_STORE).put({url,proxies,group,timestamp:Date.now()}); return new Promise(r=>tx.oncomplete=r)}catch(e){}}
+      async function getProxyCache(url){try{const d=await openDB(); const tx=d.transaction(CACHE_STORE,'readonly'); const req=tx.objectStore(CACHE_STORE).get(url); return new Promise(r=>req.onsuccess=()=>r(req.result||null))}catch(e){return null}}
+      async function savePermalink(link){try{const d=await openDB(); const tx=d.transaction(META_STORE,'readwrite'); tx.objectStore(META_STORE).put({id:PERMALINK_KEY,value:link}); return new Promise(r=>tx.oncomplete=r)}catch(e){}}
+      async function loadPermalink(){try{const d=await openDB(); const tx=d.transaction(META_STORE,'readonly'); const req=tx.objectStore(META_STORE).get(PERMALINK_KEY); return new Promise(r=>req.onsuccess=()=>r(req.result?req.result.value:''))}catch(e){return''}}
+
+      function loadSources(){try{const s=localStorage.getItem(SOURCES_KEY); return s?JSON.parse(s):[{name:'HK',url:'https://example.com/sub',type:'selector'}]}catch(e){return[{name:'HK',url:'https://example.com/sub',type:'selector'}]}}
+      function saveSources(arr){localStorage.setItem(SOURCES_KEY,JSON.stringify(arr))}
+
+      const sourcesCont=document.getElementById('sources-container');
+      const addBtn=document.getElementById('add-source');
+      const genBtn=document.getElementById('generate');
+      const refBtn=document.getElementById('refresh-generate');
+      const downBtn=document.getElementById('download');
+      const copyResBtn=document.getElementById('copy-result');
+      const configIn=document.getElementById('config-input');
+      const outArea=document.getElementById('output');
+      const resDiv=document.getElementById('result');
+      const statusDiv=document.getElementById('status');
+      const importBtn=document.getElementById('import-file-btn');
+      const linkBox=document.getElementById('subscription-link-box');
+      const linkText=document.getElementById('subscription-link-text');
+      const copyLinkBtn=document.getElementById('copy-permanent-link');
+      const noLink=document.getElementById('no-link-hint');
+      const permalinkBase=location.origin+'/api/latest';
+
+      function collectSources(){const rows=document.querySelectorAll('.source-row'); const a=[]; rows.forEach(r=>{const n=r.querySelector('.name').value.trim(),u=r.querySelector('.url').value.trim(),t=r.querySelector('.type').value; if(n||u) a.push({name:n,url:u,type:t})}); return a}
+      let saveT; function scheduleSave(){clearTimeout(saveT); saveT=setTimeout(()=>{saveSources(collectSources()); saveConfigToDB(configIn.value)},300)}
+      async function updateCacheIndicators(){const rows=document.querySelectorAll('.source-row'); for(const r of rows){const u=r.querySelector('.url'); if(!u) continue; const url=u.value.trim(); if(!url) continue; const cache=await getProxyCache(url); let sp=r.querySelector('.cache-status'); if(!sp){sp=document.createElement('span'); sp.className='cache-status'; r.appendChild(sp)} sp.textContent=cache?'缓存: '+cache.proxies.length+' 节点 ('+new Date(cache.timestamp).toLocaleString()+')':'无缓存'}}
+      function createSourceRow(name='',url='',type='selector'){const d=document.createElement('div'); d.className='source-row'; d.innerHTML=\`<input class="name" placeholder="组名" value="\${name}"><input class="url" placeholder="URL" value="\${url}"><select class="type"><option value="selector" \${type==='selector'?'selected':''}>selector</option><option value="urltest" \${type==='urltest'?'selected':''}>urltest</option></select><span class="remove-btn-wrapper"><button class="remove-btn">✕</button></span>\`; d.querySelector('.remove-btn').onclick=()=>{d.remove(); scheduleSave(); updateCacheIndicators()}; d.querySelectorAll('input,select').forEach(el=>{el.oninput=scheduleSave; el.onchange=scheduleSave}); return d}
+      function renderSources(srcs){sourcesCont.innerHTML=''; srcs.forEach(s=>sourcesCont.appendChild(createSourceRow(s.name,s.url,s.type))); updateCacheIndicators()}
+      async function fetchFromBackend(srcs){const r=await fetch('/api/fetch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sources:srcs})}); if(!r.ok){const e=await r.json().catch(()=>({})); throw new Error(e.error||'请求失败')} const d=await r.json(); return d.results}
+      function parseJSONSafe(t){const f=t.replace(/,(\\s*[}\\]])/g,'$1'); try{return JSON.parse(f)}catch(e){throw new Error('JSON格式错误：'+e.message)}}
+
+      async function doGenerate(force){
+        statusDiv.innerHTML=''; resDiv.style.display='none'; downBtn.style.display='none'; copyResBtn.style.display='none';
+        const rows=document.querySelectorAll('.source-row
+, async () => {
         try {
           await navigator.clipboard.writeText(subLinkText.textContent);
           copyPermaBtn.textContent = '✅ 已复制';
