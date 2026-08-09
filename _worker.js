@@ -151,7 +151,7 @@ function parseProxyURI(uri) {
     const schemeEnd = uri.indexOf('://');
     if (schemeEnd === -1) return null;
     const scheme = uri.substring(0, schemeEnd).toLowerCase();
-    const rest = uri.substring(schemeEnd + 3);
+    let  rest = uri.substring(schemeEnd + 3);
     let name = '';
     const hashIdx = rest.indexOf('#');
     if (hashIdx !== -1) { name = decodeURIComponent(rest.substring(hashIdx + 1)); rest = rest.substring(0, hashIdx); }
