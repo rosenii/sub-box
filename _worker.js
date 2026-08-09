@@ -1,6 +1,5 @@
-// _workers.js – Sing‑Box & Clash 订阅合并器 (最终完整版)
-// 支持 JSON (Sing‑Box) 与 YAML (Clash) 源，输出永久 Sing‑Box JSON
-// 建议在 Cloudflare Workers 中绑定 KV 命名空间至变量 SUB_CONFIG
+// _workers.js - Sing‑Box & Clash 订阅合并器（增强 YAML 解析，支持嵌套属性）
+// 部署时建议绑定 KV 至变量 SUB_CONFIG
 
 const memoryStore = new Map();
 const EXCLUDED_TYPES = ['direct', 'selector', 'urltest', 'dns', 'block'];
@@ -17,31 +16,26 @@ export default {
         },
       });
     }
-
     if (url.pathname === '/' && request.method === 'GET') {
       return new Response(getHTML(), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
       });
     }
-
     if (url.pathname === '/api/fetch' && request.method === 'POST') {
       return handleFetchProxies(request);
     }
-
     if (url.pathname === '/api/update' && request.method === 'POST') {
       return handleUpdate(request, env);
     }
-
     if (url.pathname === '/api/latest' && request.method === 'GET') {
       return handleGetLatest(env);
     }
-
     return new Response('Not Found', { status: 404 });
   },
 };
 
 /* ==================================================
-   后端：拉取并解析多个源（JSON/YAML）
+   后端拉取与解析（增强错误反馈）
    ================================================== */
 async function handleFetchProxies(request) {
   try {
@@ -53,26 +47,23 @@ async function handleFetchProxies(request) {
       const { name, url, type = 'selector' } = src;
       try {
         const resp = await fetch(url, {
-          headers: { 'User-Agent': 'SubMerger/2.0' },
+          headers: { 'User-Agent': 'SubMerger/2.1' },
         });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         let text = await resp.text();
 
-        // 尝试 Base64 解码
+        // Base64 解码尝试
         try {
           const decoded = atob(text.trim());
-          if (
-            decoded.trim().startsWith('{') ||
-            decoded.trim().startsWith('[') ||
-            decoded.includes('proxies:')
-          ) {
+          // 简单判断解码后是否为结构化文本
+          if (/^\s*[{\[]/.test(decoded) || /^proxies:/im.test(decoded) || /^\s*- /m.test(decoded)) {
             text = decoded;
           }
         } catch (_) {}
 
         let outbounds = [];
 
-        // 1. 尝试 JSON 解析 (Sing‑Box 格式)
+        // 1. 尝试 JSON
         try {
           const data = JSON.parse(text);
           if (Array.isArray(data)) {
@@ -82,17 +73,32 @@ async function handleFetchProxies(request) {
           }
         } catch (_) {}
 
-        // 2. 如果不是 JSON，尝试解析 Clash YAML
+        // 2. 尝试 Clash YAML
         if (outbounds.length === 0) {
-          const clashProxies = parseClashProxies(text);
-          if (clashProxies.length > 0) {
-            outbounds = convertClashToSingBox(clashProxies);
+          const doc = parseYAML(text);
+          let proxies = [];
+          // 查找 proxies 键（忽略大小写）
+          for (const key of Object.keys(doc)) {
+            if (key.toLowerCase() === 'proxies') {
+              proxies = doc[key];
+              break;
+            }
+          }
+          // 如果没有，但文档本身是数组，直接作为代理列表
+          if (!proxies.length && Array.isArray(doc)) {
+            proxies = doc;
+          }
+          if (proxies.length > 0) {
+            outbounds = convertClashToSingBox(proxies);
           }
         }
 
-        if (outbounds.length === 0) throw new Error('无法识别格式或无有效节点');
+        if (outbounds.length === 0) {
+          // 提供更好的错误信息
+          const preview = text.substring(0, 200).replace(/\n/g, '\\n');
+          throw new Error(`无法识别格式或无有效节点（前200字符: ${preview}）`);
+        }
 
-        // 过滤掉不需要的类型
         const filtered = outbounds.filter(
           (ob) => ob && typeof ob === 'object' && !EXCLUDED_TYPES.includes(ob.type)
         );
@@ -116,7 +122,7 @@ async function handleFetchProxies(request) {
 
     const results = await Promise.all(tasks);
 
-    // 全局 tag 去重（追加源名称后缀）
+    // 全局去重
     const usedTags = new Set();
     results.forEach((res) => {
       if (res.error || !res.proxies) return;
@@ -155,194 +161,261 @@ async function handleFetchProxies(request) {
 }
 
 /* ==================================================
-   从 Clash YAML 文本中提取 proxies 列表
+   轻量 YAML 解析器（支持嵌套映射、列表）
    ================================================== */
-function parseClashProxies(text) {
+function parseYAML(text) {
   const lines = text.split(/\r?\n/);
-  const proxies = [];
-  let inProxies = false;
-  let currentProxy = null;
-  let currentIndent = -1;
+  let i = 0;
+  const result = {};
 
-  for (let i = 0; i < lines.length; i++) {
+  function skipComments() {
+    while (i < lines.length) {
+      const raw = lines[i];
+      const trimmed = raw.replace(/#.*$/, '').trimEnd();
+      if (trimmed === '') { i++; continue; }
+      break;
+    }
+  }
+
+  function parseValue(indent) {
+    skipComments();
+    if (i >= lines.length) return null;
     const raw = lines[i];
     const line = raw.replace(/#.*$/, '').trimEnd();
-    if (line.trim() === '') continue;
+    const currentIndent = raw.search(/\S/);
+    if (currentIndent < indent) return null; // 缩进不足，返回
 
-    const indent = raw.search(/\S/);
     const content = line.trim();
 
-    if (!inProxies && content === 'proxies:') {
-      inProxies = true;
-      continue;
-    }
-
-    if (inProxies) {
-      if (indent === 0 && content !== 'proxies:' && !content.startsWith('-')) {
-        break;
-      }
-
-      if (content.startsWith('- ')) {
-        if (currentProxy) proxies.push(currentProxy);
-        currentProxy = {};
-        const rest = content.substring(2).trim();
+    // 列表项
+    if (content.startsWith('- ')) {
+      const list = [];
+      while (i < lines.length) {
+        skipComments();
+        if (i >= lines.length) break;
+        const raw2 = lines[i];
+        const line2 = raw2.replace(/#.*$/, '').trimEnd();
+        const indent2 = raw2.search(/\S/);
+        const content2 = line2.trim();
+        if (!content2.startsWith('- ') || indent2 < indent) break;
+        i++; // 消费 '- '
+        const rest = content2.substring(2).trim();
         if (rest.includes(':')) {
-          const kv = splitKeyValue(rest);
-          if (kv) currentProxy[kv.key] = kv.value;
-        }
-        currentIndent = indent;
-      } else if (currentProxy && indent > currentIndent) {
-        const kv = splitKeyValue(content);
-        if (kv) {
-          currentProxy[kv.key] = kv.value;
-        }
-      } else if (currentProxy && indent <= currentIndent) {
-        proxies.push(currentProxy);
-        currentProxy = null;
-        if (content.startsWith('- ')) {
-          const rest = content.substring(2).trim();
-          currentProxy = {};
-          const kv = splitKeyValue(rest);
-          if (kv) currentProxy[kv.key] = kv.value;
-          currentIndent = indent;
+          // 可能是 "- key: value" 或 "- key:"
+          const colonIdx = rest.indexOf(':');
+          const key = rest.substring(0, colonIdx).trim();
+          const afterKey = rest.substring(colonIdx + 1).trim();
+          if (afterKey === '') {
+            // 值为嵌套结构
+            i--; // 回退，让 parseMapping 处理
+            list.push(parseMapping(indent2 + 2));
+          } else {
+            // 单行键值
+            list.push({ [key]: parseScalar(afterKey) });
+          }
         } else {
-          break;
+          // 纯标量项
+          list.push(parseScalar(rest));
         }
+      }
+      return list;
+    }
+
+    // 映射项（键值对）
+    if (content.includes(':')) {
+      return parseMapping(indent);
+    }
+
+    // 标量
+    return parseScalar(content);
+  }
+
+  function parseMapping(baseIndent) {
+    const map = {};
+    while (i < lines.length) {
+      skipComments();
+      if (i >= lines.length) break;
+      const raw = lines[i];
+      const line = raw.replace(/#.*$/, '').trimEnd();
+      const indent = raw.search(/\S/);
+      if (indent < baseIndent) break;
+
+      const content = line.trim();
+      if (content.startsWith('- ')) break; // 列表项不应出现在映射内，但我们容错
+
+      const colonIdx = content.indexOf(':');
+      if (colonIdx === -1) { i++; continue; }
+
+      const key = content.substring(0, colonIdx).trim();
+      let afterKey = content.substring(colonIdx + 1).trim();
+
+      if (afterKey === '') {
+        i++; // 移动到下一行
+        map[key] = parseValue(indent + 2);
+      } else {
+        i++;
+        map[key] = parseScalar(afterKey);
       }
     }
+    return map;
   }
-  if (currentProxy) proxies.push(currentProxy);
-  return proxies;
-}
 
-function splitKeyValue(str) {
-  const idx = str.indexOf(':');
-  if (idx === -1) return null;
-  const key = str.substring(0, idx).trim();
-  let value = str.substring(idx + 1).trim();
-  if (
-    (value.startsWith('"') && value.endsWith('"')) ||
-    (value.startsWith("'") && value.endsWith("'"))
-  ) {
-    value = value.slice(1, -1);
+  function parseScalar(str) {
+    str = str.trim();
+    if ((str.startsWith('"') && str.endsWith('"')) || (str.startsWith("'") && str.endsWith("'"))) {
+      return str.slice(1, -1);
+    }
+    // 尝试转换为数字或布尔
+    if (str === 'true') return true;
+    if (str === 'false') return false;
+    if (/^-?\d+(\.\d+)?$/.test(str)) return Number(str);
+    return str;
   }
-  return { key, value };
-}
 
-/* ==================================================
-   将 Clash 代理对象数组转换为 Sing‑Box 出站格式
-   (支持 ss, vmess, trojan, vless, anytls, http, socks5)
-   ================================================== */
-function convertClashToSingBox(clashProxies) {
-  return clashProxies
-    .map((p) => {
-      const base = { tag: p.name || p.server || 'unknown' };
-      switch (p.type) {
-        case 'ss':
-          return {
-            ...base,
-            type: 'shadowsocks',
-            server: p.server,
-            server_port: parseInt(p.port) || 0,
-            method: p.cipher || 'aes-256-gcm',
-            password: p.password,
-          };
-        case 'vmess':
-          return {
-            ...base,
-            type: 'vmess',
-            server: p.server,
-            server_port: parseInt(p.port) || 0,
-            uuid: p.uuid,
-            security: p.cipher || 'auto',
-            alter_id: parseInt(p.alterId) || 0,
-          };
-        case 'trojan': {
-          const trojan = {
-            ...base,
-            type: 'trojan',
-            server: p.server,
-            server_port: parseInt(p.port) || 0,
-            password: p.password,
-          };
-          if (p.sni || p.servername) {
-            trojan.tls = { enabled: true, server_name: p.sni || p.servername };
-          }
-          return trojan;
+  skipComments();
+  // 检查顶层是否为数组
+  if (i < lines.length && lines[i].replace(/#.*$/, '').trim().startsWith('- ')) {
+    const arr = [];
+    while (i < lines.length) {
+      skipComments();
+      if (i >= lines.length) break;
+      const raw = lines[i];
+      const line = raw.replace(/#.*$/, '').trimEnd();
+      if (!line.trim().startsWith('- ')) break;
+      i++;
+      const rest = line.trim().substring(2).trim();
+      if (rest.includes(':')) {
+        const colonIdx = rest.indexOf(':');
+        const key = rest.substring(0, colonIdx).trim();
+        const after = rest.substring(colonIdx + 1).trim();
+        if (after === '') {
+          arr.push(parseMapping(raw.search(/\S/) + 2));
+        } else {
+          arr.push({ [key]: parseScalar(after) });
         }
-        case 'vless': {
-          const vless = {
-            ...base,
-            type: 'vless',
-            server: p.server,
-            server_port: parseInt(p.port) || 443,
-            uuid: p.uuid,
-          };
-          if (p.flow) vless.flow = p.flow;
-          if (p.tls) {
-            vless.tls = { enabled: true };
-            if (p.servername) vless.tls.server_name = p.servername;
-            if (p['reality-opts']) {
-              vless.tls.reality = { enabled: true };
-              if (p['reality-opts'].public_key)
-                vless.tls.reality.public_key = p['reality-opts'].public_key;
-              if (p['reality-opts'].short_id)
-                vless.tls.reality.short_id = p['reality-opts'].short_id;
-            }
-          }
-          if (p.network) {
-            vless.transport = { type: p.network };
-            if (p.network === 'ws') {
-              if (p.ws_opts?.path) vless.transport.path = p.ws_opts.path;
-              if (p.ws_opts?.headers?.Host)
-                vless.transport.headers = { Host: p.ws_opts.headers.Host };
-            } else if (p.network === 'grpc') {
-              if (p.grpc_opts?.serviceName)
-                vless.transport.service_name = p.grpc_opts.serviceName;
-            }
-          }
-          return vless;
-        }
-        case 'anytls': {
-          const anytls = {
-            ...base,
-            type: 'anytls',
-            server: p.server,
-            server_port: parseInt(p.port) || 443,
-            password: p.password,
-            tls: {},
-          };
-          if (p.sni || p.servername) anytls.tls.server_name = p.sni || p.servername;
-          if (Object.keys(anytls.tls).length === 0) delete anytls.tls;
-          return anytls;
-        }
-        case 'http':
-          return {
-            ...base,
-            type: 'http',
-            server: p.server,
-            server_port: parseInt(p.port) || 0,
-            username: p.username || '',
-            password: p.password || '',
-          };
-        case 'socks5':
-          return {
-            ...base,
-            type: 'socks',
-            server: p.server,
-            server_port: parseInt(p.port) || 0,
-            username: p.username || '',
-            password: p.password || '',
-          };
-        default:
-          return null;
+      } else {
+        arr.push(parseScalar(rest));
       }
-    })
-    .filter(Boolean);
+    }
+    return arr;
+  }
+
+  // 否则按映射解析
+  return parseMapping(0);
 }
 
 /* ==================================================
-   永久订阅链接处理
+   Clash 代理 → Sing‑Box 出站（支持嵌套读取）
+   ================================================== */
+function convertClashToSingBox(proxies) {
+  if (!Array.isArray(proxies)) return [];
+  return proxies.map((p) => {
+    if (!p || typeof p !== 'object') return null;
+    const base = { tag: p.name || p.server || 'unknown' };
+    switch (p.type) {
+      case 'ss':
+        return {
+          ...base,
+          type: 'shadowsocks',
+          server: p.server,
+          server_port: parseInt(p.port) || 0,
+          method: p.cipher || 'aes-256-gcm',
+          password: p.password,
+        };
+      case 'vmess':
+        return {
+          ...base,
+          type: 'vmess',
+          server: p.server,
+          server_port: parseInt(p.port) || 0,
+          uuid: p.uuid,
+          security: p.cipher || 'auto',
+          alter_id: parseInt(p.alterId) || 0,
+        };
+      case 'trojan': {
+        const trojan = {
+          ...base,
+          type: 'trojan',
+          server: p.server,
+          server_port: parseInt(p.port) || 0,
+          password: p.password,
+        };
+        if (p.sni || p.servername) {
+          trojan.tls = { enabled: true, server_name: p.sni || p.servername };
+        }
+        return trojan;
+      }
+      case 'vless': {
+        const vless = {
+          ...base,
+          type: 'vless',
+          server: p.server,
+          server_port: parseInt(p.port) || 443,
+          uuid: p.uuid,
+        };
+        if (p.flow) vless.flow = p.flow;
+        if (p.tls) {
+          vless.tls = { enabled: true };
+          if (p.servername) vless.tls.server_name = p.servername;
+          if (p['reality-opts']) {
+            vless.tls.reality = { enabled: true };
+            const ro = p['reality-opts'];
+            if (ro.public_key) vless.tls.reality.public_key = ro.public_key;
+            if (ro.short_id) vless.tls.reality.short_id = ro.short_id;
+          }
+        }
+        if (p.network) {
+          vless.transport = { type: p.network };
+          if (p.network === 'ws' && p['ws-opts']) {
+            const ws = p['ws-opts'];
+            if (ws.path) vless.transport.path = ws.path;
+            if (ws.headers && ws.headers.Host) vless.transport.headers = { Host: ws.headers.Host };
+          } else if (p.network === 'grpc' && p['grpc-opts']) {
+            const grpc = p['grpc-opts'];
+            if (grpc.serviceName) vless.transport.service_name = grpc.serviceName;
+          }
+        }
+        return vless;
+      }
+      case 'anytls': {
+        const anytls = {
+          ...base,
+          type: 'anytls',
+          server: p.server,
+          server_port: parseInt(p.port) || 443,
+          password: p.password,
+          tls: {},
+        };
+        if (p.sni || p.servername) anytls.tls.server_name = p.sni || p.servername;
+        if (Object.keys(anytls.tls).length === 0) delete anytls.tls;
+        return anytls;
+      }
+      case 'http':
+        return {
+          ...base,
+          type: 'http',
+          server: p.server,
+          server_port: parseInt(p.port) || 0,
+          username: p.username || '',
+          password: p.password || '',
+        };
+      case 'socks5':
+        return {
+          ...base,
+          type: 'socks',
+          server: p.server,
+          server_port: parseInt(p.port) || 0,
+          username: p.username || '',
+          password: p.password || '',
+        };
+      default:
+        return null;
+    }
+  }).filter(Boolean);
+}
+
+/* ==================================================
+   永久链接处理
    ================================================== */
 async function handleUpdate(request, env) {
   const configStr = JSON.stringify(await request.json());
@@ -373,7 +446,7 @@ async function handleGetLatest(env) {
 }
 
 /* ==================================================
-   前端 HTML 页面（完整交互逻辑）
+   前端 HTML（完整版，与之前相同，无变化）
    ================================================== */
 function getHTML() {
   return `<!DOCTYPE html>
